@@ -1,0 +1,25 @@
+{
+    "claude-opus-4-x-YYYYMMDD": {
+        "_comment": "槽位 1（OPUS）：在 Claude CLI /model 菜单中作为 Opus 出现。模型 ID 仅在 /v1/models 接口里返回给客户端；真正的路由由 ANTHROPIC_BASE_URL 决定。",
+        "ANTHROPIC_AUTH_TOKEN": "YOUR_UPSTREAM_TOKEN_HERE",
+        "ANTHROPIC_BASE_URL": "https://your-upstream-host.example.com/path/to/opus-endpoint"
+    },
+
+    "claude-sonnet-4-x-YYYYMMDD": {
+        "_comment": "槽位 2（SONNET）：平衡型，多数 Claude Code 子任务会路由到这里。",
+        "ANTHROPIC_AUTH_TOKEN": "YOUR_UPSTREAM_TOKEN_HERE",
+        "ANTHROPIC_BASE_URL": "https://your-upstream-host.example.com/path/to/sonnet-endpoint"
+    },
+
+    "claude-haiku-4-x-YYYYMMDD": {
+        "_comment": "槽位 3（HAIKU）：轻量/小快任务（Tool 调用、commit message 等）。",
+        "ANTHROPIC_AUTH_TOKEN": "YOUR_UPSTREAM_TOKEN_HERE",
+        "ANTHROPIC_BASE_URL": "https://your-upstream-host.example.com/path/to/haiku-endpoint"
+    },
+
+    "claude-fable-5-x-YYYYMMDD": {
+        "_comment": "槽位 4（FABLE）：claude-code v2.1.172+ 新增的 Fable 5 档位。CLI 会把 fable 档请求路由到这里，并和 OPUS 配合做 fallback。",
+        "ANTHROPIC_AUTH_TOKEN": "YOUR_UPSTREAM_TOKEN_HERE",
+        "ANTHROPIC_BASE_URL": "https://your-upstream-host.example.com/path/to/fable-endpoint"
+    }
+}
