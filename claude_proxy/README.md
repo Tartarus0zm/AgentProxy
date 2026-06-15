@@ -7,7 +7,7 @@
 - **多模型路由**：根据请求 `model` 字段自动转发到不同上游 endpoint
 - **SSE 流式透传**：完整支持 `stream: true` 的逐 token 输出，自动处理 `Accept-Encoding` 避免 gzip 缓冲卡死
 - **SDK 风格容错**：网络错误 / 408 / 409 / 429 / 5xx 自动重试（仅在流开始前），指数退避 + 抖动 + 尊重 `Retry-After`
-- **流式心跳保活**：每 20 秒注入一次 SSE `:keep-alive` 注释，避免中间层（nginx / 客户端 fetch idle）误判超时
+- **流式透明透传**：默认不注入任何 SSE 内容；可显式开启 `--stream-keepalive` 做保活
 - **热加载配置**：通过 `/admin/reload` 接口或 `bin/reload_config.sh` 脚本动态生效
 - **自动同步 `~/.claude/settings.json`**：根据 `config.json` 自动写入 Claude CLI 需要的环境变量
 - **滚动日志**：Python `RotatingFileHandler`，默认 6 个文件 × 100MB
@@ -62,7 +62,7 @@ vim config.json
 启动成功后会自动：
 
 1. 写入 PID 文件 `log/proxy.pid`
-2. 同步 `~/.claude/settings.json`，把最多 4 个模型分别注入 `ANTHROPIC_DEFAULT_OPUS_MODEL` / `SONNET_MODEL` / `HAIKU_MODEL` / `FABLE_MODEL` 四个槽位
+2. 同步 `~/.claude/settings.json`，把配置中的模型注入 `ANTHROPIC_DEFAULT_OPUS_MODEL` / `SONNET_MODEL` / `HAIKU_MODEL` / `FABLE_MODEL` 四个槽位；优先使用每个模型条目的 `mapping_model`，未显式配置的槽位继续按 JSON 顺序 fallback
 3. 设置 `ANTHROPIC_BASE_URL = http://<本机>:8080`，让 Claude CLI 走代理
 
 ### 3. 配置 Claude CLI 的环境变量
@@ -115,7 +115,8 @@ claude
 | 约定 | 说明 |
 |---|---|
 | **建议 3~4 个模型** | claude-code v2.1.172+ 在原有 OPUS / SONNET / HAIKU 之外新增了 **FABLE** 槽位（Fable 5 档位），共支持 4 个家族槽位。配置 ≤4 项，缺失的槽位会回退到 config 中**最后一个**模型。 |
-| **按顺序映射槽位** | 第 **1** 个 → `ANTHROPIC_DEFAULT_OPUS_MODEL`；第 **2** 个 → `SONNET_MODEL`；第 **3** 个 → `HAIKU_MODEL`；第 **4** 个 → `FABLE_MODEL` |
+| **显式映射槽位** | 每个模型条目可选 `"mapping_model": "opus" | "sonnet" | "haiku" | "fable"`。配置后优先写入对应的 `ANTHROPIC_DEFAULT_*_MODEL`。 |
+| **兼容旧顺序映射** | 没有配置 `mapping_model` 的槽位继续按旧规则 fallback：第 **1** 个 → `OPUS`；第 **2** 个 → `SONNET`；第 **3** 个 → `HAIKU`；第 **4** 个 → `FABLE`。 |
 | **默认模型** | 配置文件中**第 1 个**模型 ID 会写入 `ANTHROPIC_MODEL`（即 CLI 启动后的默认模型） |
 | **模型 ID 命名** | 推荐 `claude-{family}-{version}-{date}`（如 `claude-opus-4-8-20260101`），不影响功能但便于在菜单中识别 |
 | **token / URL 含义** | `ANTHROPIC_AUTH_TOKEN` 是上游网关 token；`ANTHROPIC_BASE_URL` 是上游 endpoint **完整 URL**（可以带路径） |
@@ -125,18 +126,22 @@ claude
 ```json
 {
     "claude-opus-4-x-YYYYMMDD": {
+        "mapping_model": "opus",
         "ANTHROPIC_AUTH_TOKEN": "YOUR_UPSTREAM_TOKEN_HERE",
         "ANTHROPIC_BASE_URL": "https://your-upstream-host.example.com/path/to/opus-endpoint"
     },
     "claude-sonnet-4-x-YYYYMMDD": {
+        "mapping_model": "sonnet",
         "ANTHROPIC_AUTH_TOKEN": "YOUR_UPSTREAM_TOKEN_HERE",
         "ANTHROPIC_BASE_URL": "https://your-upstream-host.example.com/path/to/sonnet-endpoint"
     },
     "claude-haiku-4-x-YYYYMMDD": {
+        "mapping_model": "haiku",
         "ANTHROPIC_AUTH_TOKEN": "YOUR_UPSTREAM_TOKEN_HERE",
         "ANTHROPIC_BASE_URL": "https://your-upstream-host.example.com/path/to/haiku-endpoint"
     },
     "claude-fable-5-x-YYYYMMDD": {
+        "mapping_model": "fable",
         "ANTHROPIC_AUTH_TOKEN": "YOUR_UPSTREAM_TOKEN_HERE",
         "ANTHROPIC_BASE_URL": "https://your-upstream-host.example.com/path/to/fable-endpoint"
     }
@@ -152,6 +157,7 @@ claude
 - **`ANTHROPIC_BASE_URL`**：上游完整 URL，**包含路径**。例如内网网关常见形式：  
   `https://gateway.example.com/api/gateway/v1/endpoints/ep-xxxxx/claude-code-proxy`  
   注意：**模型 ID 通常已经编码在 URL 路径中**（如 `ep-xxxxx`），所以请求 body 里的 `model` 字段对真正路由并不重要。
+- **`mapping_model`**：可选，取值为 `opus` / `sonnet` / `haiku` / `fable`，用于显式指定该模型写入哪个 Claude Code 家族槽位。未配置或某个槽位没有显式配置时，继续使用旧的 JSON 顺序 fallback 规则。
 - **`_comment`**：JSON 不支持注释，使用 `_comment` 字段做行内说明会被代理忽略（不报错）。
 
 ### 热加载
@@ -249,7 +255,7 @@ python3 proxy.py \
 | `--log-backup-count` | `PROXY_LOG_BACKUP_COUNT` | `6` |
 | `--http-timeout` | `PROXY_HTTP_TIMEOUT` | `600`（秒，非流式 socket 超时） |
 | `--stream-timeout` | `PROXY_STREAM_TIMEOUT` | `600`（秒，流式真·空闲上限） |
-| `--stream-keepalive` | `PROXY_STREAM_KEEPALIVE` | `20`（秒，0 = 禁用） |
+| `--stream-keepalive` | `PROXY_STREAM_KEEPALIVE` | `0`（秒，0 = 禁用；默认保持 SSE 响应透明） |
 | `--upstream-idle-limit` | `PROXY_UPSTREAM_IDLE_LIMIT` | `0`（秒，0 = 禁用；>0 时上游静默达此秒数主动关流并写错误事件） |
 | `--max-retries` | `PROXY_MAX_RETRIES` | `2`（仅流开始前重试） |
 
@@ -309,14 +315,14 @@ Stream finished: lines=247 bytes=18432 keepalives=0 idle_at_close=0.04s client_g
 
 ### Q: `/model` 菜单只显示 Default/Sonnet/Sonnet 1M/Haiku，没有我配置的模型？
 
-A: Claude CLI 的 `/model` UI 是**硬编码的家族选择菜单**，不会从 `/v1/models` 动态加载。代理在启动时已经把你的模型按位置分别注入到 `ANTHROPIC_DEFAULT_OPUS/SONNET/HAIKU/FABLE_MODEL` 槽位，菜单里选哪个槽位就走对应的上游 endpoint。
+A: Claude CLI 的 `/model` UI 是**硬编码的家族选择菜单**，不会从 `/v1/models` 动态加载。代理在启动时会根据 `mapping_model`（或旧的 JSON 顺序 fallback）把你的模型注入到 `ANTHROPIC_DEFAULT_OPUS/SONNET/HAIKU/FABLE_MODEL` 槽位，菜单里选哪个槽位就走对应的上游 endpoint。
 
 ### Q: 什么是 FABLE 槽位？我需要配吗？
 
-A: claude-code v2.1.172+ 新增的第 4 个家族档位（Fable 5），与 OPUS 4.8 配合做自动 fallback。proxy 已经支持把 `config.json` 第 4 个模型注入 `ANTHROPIC_DEFAULT_FABLE_MODEL`。
+A: claude-code v2.1.172+ 新增的第 4 个家族档位（Fable 5），与 OPUS 4.8 配合做自动 fallback。proxy 支持通过 `mapping_model: "fable"` 显式注入 `ANTHROPIC_DEFAULT_FABLE_MODEL`；未配置时继续使用旧规则回退到第 4 个/最后一个模型。
 
-- 如果你有独立的 Fable endpoint：在 `config.json` 里加上第 4 项即可
-- 如果暂时没有：保持 3 项不变，proxy 会让 fable 自动回退到最后一个模型，不会报错
+- 如果你有独立的 Fable endpoint：在对应模型条目里配置 `"mapping_model": "fable"` 即可
+- 如果暂时没有：不配置 `mapping_model: "fable"` 也可以，proxy 会让 fable 按旧顺序规则自动回退到第 4 个/最后一个模型，不会报错
 
 ### Q: 上游返回 `429 TooManyRequests`？
 

@@ -196,11 +196,20 @@ def get_default_model_config():
 
 # ── Claude Code settings sync ────────────────────────────────────────────────
 
+_CLAUDE_MODEL_SLOTS = ("opus", "sonnet", "haiku", "fable")
+_CLAUDE_SLOT_ENV_NAMES = {
+    "opus": "ANTHROPIC_DEFAULT_OPUS_MODEL",
+    "sonnet": "ANTHROPIC_DEFAULT_SONNET_MODEL",
+    "haiku": "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+    "fable": "ANTHROPIC_DEFAULT_FABLE_MODEL",
+}
+
+
 def _pick_model_for_slot(slot, model_ids):
-    """Strict positional mapping: 1st->opus, 2nd->sonnet, 3rd->haiku, 4th->fable.
+    """Strict positional fallback: 1st->opus, 2nd->sonnet, 3rd->haiku, 4th->fable.
 
     If config has fewer entries than the slot index requires, missing slots
-    fall back to the last available model.
+    fall back to the last available entry.
     """
     if not model_ids:
         return None
@@ -210,6 +219,51 @@ def _pick_model_for_slot(slot, model_ids):
     if idx < len(model_ids):
         return model_ids[idx]
     return model_ids[-1]
+
+
+def _build_slot_mapping(config):
+    """Build Claude family slot mapping from config.
+
+    Each model entry may optionally set:
+        "mapping_model": "opus" | "sonnet" | "haiku" | "fable"
+
+    Explicit mapping_model wins for that slot. Slots without explicit mapping
+    keep the historical positional fallback behavior for backward compatibility.
+    Invalid/duplicate mapping_model values are ignored with warnings rather than
+    breaking startup.
+    """
+    model_ids = list(config.keys())
+    mapping = {slot: _pick_model_for_slot(slot, model_ids) for slot in _CLAUDE_MODEL_SLOTS}
+    explicit = {}
+
+    for model_id in model_ids:
+        entry = config.get(model_id) or {}
+        raw_slot = entry.get("mapping_model")
+        if raw_slot in (None, ""):
+            continue
+        if not isinstance(raw_slot, str):
+            logger.warning(
+                "Ignoring non-string mapping_model for model=%s value=%r",
+                model_id, raw_slot,
+            )
+            continue
+        slot = raw_slot.strip().lower()
+        if slot not in _CLAUDE_MODEL_SLOTS:
+            logger.warning(
+                "Ignoring invalid mapping_model for model=%s value=%r; expected one of %s",
+                model_id, raw_slot, ",".join(_CLAUDE_MODEL_SLOTS),
+            )
+            continue
+        if slot in explicit:
+            logger.warning(
+                "Duplicate mapping_model=%s: keeping first model=%s, ignoring model=%s",
+                slot, explicit[slot], model_id,
+            )
+            continue
+        mapping[slot] = model_id
+        explicit[slot] = model_id
+
+    return mapping, explicit
 
 
 def _proxy_base_url():
@@ -231,11 +285,11 @@ def sync_claude_settings():
     if not model_ids:
         return False, {"error": "No models in proxy configuration; nothing to sync"}
 
-    # Slot mapping (strict positional): 1st->opus, 2nd->sonnet, 3rd->haiku, 4th->fable
-    opus_id = _pick_model_for_slot("opus", model_ids)
-    sonnet_id = _pick_model_for_slot("sonnet", model_ids)
-    haiku_id = _pick_model_for_slot("haiku", model_ids)
-    fable_id = _pick_model_for_slot("fable", model_ids)
+    mapping, explicit_mapping = _build_slot_mapping(_config)
+    opus_id = mapping["opus"]
+    sonnet_id = mapping["sonnet"]
+    haiku_id = mapping["haiku"]
+    fable_id = mapping["fable"]
 
     base_url = _proxy_base_url()
     # Default model: always the FIRST entry in config.json
@@ -286,16 +340,20 @@ def sync_claude_settings():
         logger.error("Failed to write %s: %s", _CLAUDE_SETTINGS_PATH, e)
         return False, {"error": f"Failed to write settings: {e}"}
 
-    mapping = {"opus": opus_id, "sonnet": sonnet_id, "haiku": haiku_id, "fable": fable_id}
+    mapping_source = {
+        slot: "explicit" if slot in explicit_mapping else "positional_fallback"
+        for slot in _CLAUDE_MODEL_SLOTS
+    }
     logger.info(
-        "Synced %s -> base_url=%s, default=%s, mapping=%s",
-        _CLAUDE_SETTINGS_PATH, base_url, default_model, mapping,
+        "Synced %s -> base_url=%s, default=%s, mapping=%s, mapping_source=%s",
+        _CLAUDE_SETTINGS_PATH, base_url, default_model, mapping, mapping_source,
     )
     return True, {
         "path": str(_CLAUDE_SETTINGS_PATH),
         "base_url": base_url,
         "default_model": default_model,
         "mapping": mapping,
+        "mapping_source": mapping_source,
     }
 
 
@@ -406,7 +464,13 @@ _DEFAULT_STREAM_TIMEOUT = 600            # seconds — upper bound on socket idl
                                          # 300s bodyTimeout) on purpose, so
                                          # that long upstream "thinking" gaps
                                          # don't cause us to give up first.
-_DEFAULT_STREAM_KEEPALIVE = 20           # seconds between proxy-injected SSE pings
+_DEFAULT_STREAM_KEEPALIVE = 0            # seconds between proxy-injected SSE pings.
+                                         # Default is 0 because this proxy must be
+                                         # transparent for Anthropic SSE streams:
+                                         # Claude Code and the upstream speak the
+                                         # same protocol, so the proxy must not
+                                         # inject extra events/comments unless the
+                                         # operator explicitly opts in.
 _DEFAULT_UPSTREAM_IDLE_LIMIT = 0         # 0 = disabled. Only set >0 if you want
                                          # the proxy to proactively close streams
                                          # when upstream truly stops sending data
@@ -422,7 +486,231 @@ _stream_keepalive = _DEFAULT_STREAM_KEEPALIVE
 _upstream_idle_limit = _DEFAULT_UPSTREAM_IDLE_LIMIT
 _max_retries = _DEFAULT_MAX_RETRIES
 
-# Status codes that the official SDK retries on (for non-streaming or pre-stream).
+# Optional diagnostics for tool-use corruption. Enabled by default because it
+# logs only compact metadata (tool names / input types / delta byte counts), not
+# full prompts or tool arguments. Set CLAUDE_PROXY_TOOL_DIAG=0 to disable.
+_TOOL_DIAG_ENABLED = os.environ.get("CLAUDE_PROXY_TOOL_DIAG", "1").lower() not in {
+    "0", "false", "no", "off"
+}
+
+
+class StreamToolDiagnostics:
+    """Parse already-forwarded Anthropic SSE lines and log tool-use integrity.
+
+    The proxy is supposed to be byte-for-byte transparent for /v1/messages
+    streams. If Claude Code later reports `Invalid tool parameters`, this
+    diagnostic tells us whether the upstream stream itself contained an empty or
+    malformed tool input, or whether input deltas were seen on the wire.
+    """
+
+    def __init__(self, model):
+        self.model = model
+        self.event = None
+        self.data_lines = []
+        self.blocks = {}
+
+    def feed(self, line):
+        if not _TOOL_DIAG_ENABLED:
+            return
+        try:
+            text = line.decode("utf-8", errors="replace")
+        except Exception:
+            return
+
+        stripped = text.rstrip("\r\n")
+        if not stripped:
+            self._finish_event()
+            return
+        if stripped.startswith(":"):
+            return
+        if stripped.startswith("event:"):
+            self.event = stripped[len("event:"):].strip()
+            return
+        if stripped.startswith("data:"):
+            self.data_lines.append(stripped[len("data:"):].lstrip())
+
+    def _finish_event(self):
+        if not self.data_lines:
+            self.event = None
+            return
+        raw_data = "\n".join(self.data_lines)
+        event = self.event
+        self.event = None
+        self.data_lines = []
+        try:
+            data = json.loads(raw_data)
+        except Exception:
+            return
+
+        typ = data.get("type") or event
+        if typ == "content_block_start":
+            idx = data.get("index")
+            block = data.get("content_block") or {}
+            if block.get("type") == "tool_use":
+                initial_input = block.get("input")
+                rec = {
+                    "id": block.get("id"),
+                    "name": block.get("name"),
+                    "initial_input_type": type(initial_input).__name__,
+                    "initial_input_empty": initial_input == {},
+                    "delta_bytes": 0,
+                    "delta_count": 0,
+                    "partial_json": "",
+                }
+                self.blocks[idx] = rec
+                if initial_input in ({}, None) or not block.get("name"):
+                    logger.warning(
+                        "TOOL_DIAG start suspicious model=%s index=%s id=%s name=%r "
+                        "initial_input_type=%s initial_input_empty=%s",
+                        self.model, idx, rec["id"], rec["name"],
+                        rec["initial_input_type"], rec["initial_input_empty"],
+                    )
+        elif typ == "content_block_delta":
+            idx = data.get("index")
+            delta = data.get("delta") or {}
+            if delta.get("type") == "input_json_delta":
+                rec = self.blocks.setdefault(idx, {})
+                frag = delta.get("partial_json") or ""
+                rec["delta_bytes"] = rec.get("delta_bytes", 0) + len(frag.encode("utf-8"))
+                rec["delta_count"] = rec.get("delta_count", 0) + 1
+                # Keep only tool argument deltas. This is bounded by a single
+                # tool input and used only for schema-level diagnostics.
+                rec["partial_json"] = rec.get("partial_json", "") + frag
+        elif typ == "content_block_stop":
+            idx = data.get("index")
+            rec = self.blocks.get(idx)
+            if rec and rec.get("name"):
+                self._log_tool_stop(idx, rec)
+
+    def _summarize_reconstructed_input(self, rec):
+        partial = rec.get("partial_json") or ""
+        if not partial:
+            return {"json_ok": None, "keys": [], "error": "no_partial_json"}
+        try:
+            reconstructed = json.loads(partial)
+        except json.JSONDecodeError as exc:
+            pos = getattr(exc, "pos", None)
+            around = partial[max(0, pos - 120):pos + 120] if isinstance(pos, int) else ""
+            return {
+                "json_ok": False,
+                "keys": [],
+                "error": type(exc).__name__,
+                "msg": exc.msg,
+                "pos": pos,
+                "lineno": exc.lineno,
+                "colno": exc.colno,
+                "len": len(partial),
+                "preview": partial[:160],
+                "around_error": around,
+                "tail": partial[-240:],
+            }
+        except Exception as exc:
+            return {
+                "json_ok": False,
+                "keys": [],
+                "error": type(exc).__name__,
+                "len": len(partial),
+                "preview": partial[:160],
+                "tail": partial[-240:],
+            }
+        if not isinstance(reconstructed, dict):
+            return {
+                "json_ok": True,
+                "type": type(reconstructed).__name__,
+                "keys": [],
+            }
+        summary = {
+            "json_ok": True,
+            "type": "dict",
+            "keys": sorted(reconstructed.keys()),
+        }
+        if rec.get("name") == "AskUserQuestion":
+            questions = reconstructed.get("questions")
+            summary.update({
+                "questions_type": type(questions).__name__,
+                "questions_len": len(questions) if isinstance(questions, list) else None,
+                "question_keys_0": (
+                    sorted(questions[0].keys())
+                    if isinstance(questions, list)
+                    and questions
+                    and isinstance(questions[0], dict)
+                    else None
+                ),
+            })
+        elif rec.get("name") == "Bash":
+            summary.update({
+                "has_command": isinstance(reconstructed.get("command"), str),
+                "has_description": isinstance(reconstructed.get("description"), str),
+            })
+        return summary
+
+    def _log_tool_stop(self, idx, rec):
+        input_summary = self._summarize_reconstructed_input(rec)
+        if rec.get("initial_input_empty") and rec.get("delta_bytes", 0) == 0:
+            logger.warning(
+                "TOOL_DIAG stop EMPTY_INPUT model=%s index=%s id=%s name=%s "
+                "delta_count=%d delta_bytes=%d reconstructed=%s",
+                self.model, idx, rec.get("id"), rec.get("name"),
+                rec.get("delta_count", 0), rec.get("delta_bytes", 0), input_summary,
+            )
+        else:
+            log = logger.warning if not input_summary.get("json_ok") else logger.info
+            log(
+                "TOOL_DIAG stop model=%s index=%s id=%s name=%s "
+                "initial_empty=%s delta_count=%d delta_bytes=%d reconstructed=%s",
+                self.model, idx, rec.get("id"), rec.get("name"),
+                rec.get("initial_input_empty"), rec.get("delta_count", 0),
+                rec.get("delta_bytes", 0), input_summary,
+            )
+
+
+# NOTE: Do not normalize or rewrite upstream Anthropic responses here.
+# Claude Code and the upstream Wanqing Claude API speak the same protocol, so
+# response-body transparency is the root invariant of this proxy. Keep any
+# response inspection diagnostic-only.
+
+
+def summarize_request_tools(body):
+    """Return compact request tool-schema diagnostics without logging prompts."""
+    if not _TOOL_DIAG_ENABLED:
+        return None
+    try:
+        req = json.loads(body)
+    except Exception:
+        return None
+    tools = req.get("tools") or []
+    if not isinstance(tools, list):
+        return {"tools_type": type(tools).__name__}
+    names = []
+    ask_schema = None
+    for tool in tools:
+        if not isinstance(tool, dict):
+            continue
+        name = tool.get("name")
+        if name:
+            names.append(name)
+        if name == "AskUserQuestion":
+            schema = tool.get("input_schema") or {}
+            props = schema.get("properties") if isinstance(schema, dict) else None
+            questions = props.get("questions") if isinstance(props, dict) else None
+            ask_schema = {
+                "required": schema.get("required") if isinstance(schema, dict) else None,
+                "questions_type": questions.get("type") if isinstance(questions, dict) else None,
+                "questions_items_type": (
+                    questions.get("items", {}).get("type")
+                    if isinstance(questions, dict) and isinstance(questions.get("items"), dict)
+                    else None
+                ),
+            }
+    return {
+        "tool_count": len(tools),
+        "has_AskUserQuestion": "AskUserQuestion" in names,
+        "has_TaskCreate": "TaskCreate" in names,
+        "has_TaskList": "TaskList" in names,
+        "tool_names": names,
+        "AskUserQuestion_schema": ask_schema,
+    }
+
 _RETRIABLE_STATUS = {408, 409, 429, 500, 502, 503, 504}
 
 
@@ -719,6 +1007,23 @@ def forward_request(method, target_base, target_path, headers, body, stream=Fals
 
 # ── Request Handler ──────────────────────────────────────────────────────────
 
+class _DownstreamGoneError(Exception):
+    """Raised when the downstream client (Claude CLI) disconnected.
+
+    Used to distinguish 'client already gone, do NOT 502' from real upstream
+    failures. ``phase`` indicates where the disconnect was detected:
+      - 'write_headers'   : while sending response headers downstream
+      - 'write_response'  : while writing non-stream response body
+      - 'write_stream'    : while streaming SSE bytes
+      - 'write_keepalive' : while writing :keep-alive ping
+    """
+
+    def __init__(self, phase, cause):
+        super().__init__(f"downstream client gone (phase={phase}): {cause}")
+        self.phase = phase
+        self.cause = cause
+
+
 class ProxyHTTPRequestHandler(BaseHTTPRequestHandler):
     """HTTP request handler for the proxy server."""
 
@@ -789,11 +1094,16 @@ class ProxyHTTPRequestHandler(BaseHTTPRequestHandler):
 
         # Determine if streaming
         is_stream = False
+        tool_summary = None
         try:
             req_data = json.loads(body)
             is_stream = req_data.get("stream", False)
+            tool_summary = summarize_request_tools(body)
         except (json.JSONDecodeError, TypeError):
             pass
+
+        if tool_summary:
+            logger.info("TOOL_DIAG request model=%s summary=%s", model, tool_summary)
 
         # Build forwarded headers
         fwd_headers = dict(self.headers)
@@ -816,22 +1126,45 @@ class ProxyHTTPRequestHandler(BaseHTTPRequestHandler):
                     self.command, target_base, target_path,
                     fwd_headers, body,
                 )
+        except _DownstreamGoneError as e:
+            # Client disconnected before / during write-back. Upstream call may
+            # have succeeded; this is NOT an upstream error, do not 502.
+            logger.warning(
+                "Downstream client gone while proxying to %s%s (phase=%s): %s",
+                target_base, target_path, e.phase, e.cause,
+            )
+            # Cannot send_error_response because the socket is already broken.
         except Exception as e:
-            logger.error("Error proxying to %s%s: %s", target_base, target_path, e)
-            self._send_error_response(502, "api_error", f"Upstream request failed: {str(e)}")
+            logger.error(
+                "Error proxying to %s%s (phase=upstream): %s",
+                target_base, target_path, e,
+            )
+            try:
+                self._send_error_response(502, "api_error", f"Upstream request failed: {str(e)}")
+            except (BrokenPipeError, ConnectionResetError) as werr:
+                logger.warning(
+                    "Could not deliver 502 to client (already gone): %s", werr,
+                )
 
     def _handle_normal_forward(self, method, target_base, target_path, headers, body):
-        """Forward a request and return the full response."""
+        """Forward a request and return the full response.
+
+        Raises _DownstreamGoneError if the failure happens while writing back
+        to the client (so the caller can distinguish from upstream errors).
+        """
         status, resp_headers, resp_body = forward_request(
             method, target_base, target_path, headers, body, stream=False,
         )
 
-        self.send_response(status)
-        for key, value in resp_headers.items():
-            if key.lower() not in ("transfer-encoding", "connection", "content-encoding"):
-                self.send_header(key, value)
-        self.end_headers()
-        self.wfile.write(resp_body)
+        try:
+            self.send_response(status)
+            for key, value in resp_headers.items():
+                if key.lower() not in ("transfer-encoding", "connection", "content-encoding"):
+                    self.send_header(key, value)
+            self.end_headers()
+            self.wfile.write(resp_body)
+        except (BrokenPipeError, ConnectionResetError) as e:
+            raise _DownstreamGoneError("write_response", e) from e
 
     def _handle_streaming_forward(self, method, target_base, target_path, headers, body, model):
         """
@@ -895,6 +1228,15 @@ class ProxyHTTPRequestHandler(BaseHTTPRequestHandler):
             self.send_header("Cache-Control", "no-cache")
             self.send_header("X-Accel-Buffering", "no")
             self.end_headers()
+        except (BrokenPipeError, ConnectionResetError) as e:
+            logger.warning(
+                "Failed sending response headers downstream (client gone): %s", e,
+            )
+            try:
+                conn.close()
+            except Exception:
+                pass
+            raise _DownstreamGoneError("write_headers", e) from e
         except Exception as e:
             logger.error("Failed sending response headers downstream: %s", e)
             try:
@@ -948,6 +1290,23 @@ class ProxyHTTPRequestHandler(BaseHTTPRequestHandler):
         last_ping_at = time.monotonic()
         keepalive_sent = 0
         client_gone = False
+        exit_reason = "unknown"
+        first_event_at = None
+        last_err = None
+        tool_diag = StreamToolDiagnostics(model)
+
+        def _write_upstream_line(line):
+            """Write exactly one upstream SSE line to Claude Code.
+
+            The proxy's default contract is transparent Anthropic-protocol
+            forwarding. Diagnostics may parse a copy of the line, but must never
+            rewrite, buffer, synthesize, or drop upstream response bytes.
+            """
+            nonlocal bytes_streamed, line_count
+            self.wfile.write(line)
+            self.wfile.flush()
+            bytes_streamed += len(line)
+            line_count += 1
 
         try:
             while True:
@@ -961,9 +1320,9 @@ class ProxyHTTPRequestHandler(BaseHTTPRequestHandler):
 
                 if kind == "data":
                     line = payload
+                    tool_diag.feed(line)
                     try:
-                        self.wfile.write(line)
-                        self.wfile.flush()
+                        _write_upstream_line(line)
                     except (BrokenPipeError, ConnectionResetError) as e:
                         logger.warning(
                             "Client disconnected mid-stream "
@@ -971,32 +1330,47 @@ class ProxyHTTPRequestHandler(BaseHTTPRequestHandler):
                             line_count, bytes_streamed, keepalive_sent, e,
                         )
                         client_gone = True
+                        exit_reason = "client_gone"
+                        last_err = e
                         break
-                    bytes_streamed += len(line)
-                    line_count += 1
+                    if first_event_at is None:
+                        first_event_at = time.monotonic()
                     last_data_at = time.monotonic()
                     last_ping_at = time.monotonic()
                     continue
 
                 if kind == "eof":
-                    # Upstream closed cleanly
+                    idle_before_eof = time.monotonic() - last_data_at
+                    logger.info(
+                        "Upstream EOF (clean close) after %d lines / %d bytes; "
+                        "idle_before_eof=%.2fs",
+                        line_count, bytes_streamed, idle_before_eof,
+                    )
+                    exit_reason = "upstream_eof"
                     break
 
                 if kind == "err":
                     exc = payload
+                    last_err = exc
                     msg = str(exc)
                     if "timed out" in msg.lower() or isinstance(exc, TimeoutError):
                         logger.error(
                             "Upstream stream read timed out "
-                            "(streamed %d lines / %d bytes, %d keep-alives sent).",
+                            "(streamed %d lines / %d bytes, %d keep-alives sent). "
+                            "exc_type=%s",
                             line_count, bytes_streamed, keepalive_sent,
+                            type(exc).__name__,
                         )
+                        exit_reason = "upstream_read_timeout"
                     else:
                         logger.error(
                             "Streaming read error after %d lines / %d bytes "
-                            "(%d keep-alives sent): %s",
-                            line_count, bytes_streamed, keepalive_sent, exc,
+                            "(%d keep-alives sent). exc_type=%s msg=%s",
+                            line_count, bytes_streamed, keepalive_sent,
+                            type(exc).__name__, msg,
+                            exc_info=True,
                         )
+                        exit_reason = "upstream_read_error"
                     break
 
                 # kind == "tick": no upstream data in the last 1s.
@@ -1011,6 +1385,7 @@ class ProxyHTTPRequestHandler(BaseHTTPRequestHandler):
                         "%d keep-alives sent). Closing.",
                         _stream_timeout, line_count, bytes_streamed, keepalive_sent,
                     )
+                    exit_reason = "stream_timeout"
                     break
 
                 # Proactive upstream-health hint (only if configured > 0).
@@ -1050,8 +1425,10 @@ class ProxyHTTPRequestHandler(BaseHTTPRequestHandler):
                             "Client already gone while sending synthetic stop: %s", e,
                         )
                         client_gone = True
+                        last_err = e
                     except Exception as e:
                         logger.warning("Failed to write synthetic stop event: %s", e)
+                    exit_reason = "upstream_idle_limit"
                     break
 
                 # Inject SSE comment ping to keep intermediaries alive
@@ -1069,14 +1446,16 @@ class ProxyHTTPRequestHandler(BaseHTTPRequestHandler):
                             line_count, bytes_streamed, e,
                         )
                         client_gone = True
+                        exit_reason = "client_gone_on_keepalive"
+                        last_err = e
                         break
         finally:
             duration = time.monotonic() - last_data_at
             logger.info(
                 "Stream finished: lines=%d bytes=%d keepalives=%d "
-                "idle_at_close=%.2fs client_gone=%s",
+                "idle_at_close=%.2fs client_gone=%s exit_reason=%s",
                 line_count, bytes_streamed, keepalive_sent,
-                max(0.0, duration), client_gone,
+                max(0.0, duration), client_gone, exit_reason,
             )
             # Tell the reader thread to stop and tear down the connection.
             reader_stop.set()
