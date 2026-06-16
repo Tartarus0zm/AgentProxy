@@ -1,0 +1,76 @@
+{
+    "// _comment": "OpenAI ↔ Claude Code 适配代理。每个 key 是「在 Claude CLI 里看到的 Claude 风格 model id」；value 描述如何转发到 OpenAI 兼容上游。`provider` 只表示服务商（openai/deepseek/glm/kimi/...，默认 openai）；模型族特殊兼容通过可选 `model_series` 或 `model_code` 表示。完整对照表见 README.md §3.1。",
+
+    "claude-opus-4-x-via-openai": {
+        "_comment": "显式映射到 OPUS 槽位；gpt-5 是 reasoning 模型 → max_completion_tokens + 自动把 reasoning_content 透传为 thinking block。",
+        "mapping_model": "opus",
+        "provider": "openai",
+        "model_series": "gpt-5",
+        "OPENAI_API_KEY": "sk-YOUR_OPENAI_KEY_HERE",
+        "OPENAI_BASE_URL": "https://api.openai.com/v1",
+        "upstream_model": "gpt-5"
+    },
+    "claude-sonnet-4-x-via-openai": {
+        "_comment": "显式映射到 SONNET 槽位；gpt-4o 是普通 chat 模型，无需 model_series。",
+        "mapping_model": "sonnet",
+        "provider": "openai",
+        "OPENAI_API_KEY": "sk-YOUR_OPENAI_KEY_HERE",
+        "OPENAI_BASE_URL": "https://api.openai.com/v1",
+        "upstream_model": "gpt-4o"
+    },
+    "claude-haiku-4-x-via-deepseek": {
+        "_comment": "DeepSeek V3 普通 chat 模型，标准参数即可。",
+        "mapping_model": "haiku",
+        "provider": "deepseek",
+        "OPENAI_API_KEY": "sk-DEEPSEEK_KEY_HERE",
+        "OPENAI_BASE_URL": "https://api.deepseek.com/v1",
+        "upstream_model": "deepseek-chat"
+    },
+    "claude-fable-5-x-via-openai": {
+        "_comment": "显式映射到 FABLE 槽位；gpt-4o-mini。",
+        "mapping_model": "fable",
+        "provider": "openai",
+        "OPENAI_API_KEY": "sk-YOUR_OPENAI_KEY_HERE",
+        "OPENAI_BASE_URL": "https://api.openai.com/v1",
+        "upstream_model": "gpt-4o-mini"
+    },
+
+    "// thinking_examples_comment": "下面是几个带 reasoning 通道的 thinking 模型示例。这类模型（deepseek-reasoner / deepseek-v4-pro / glm-4.6 / kimi-k2-thinking / o3 / gpt-5）必须声明 model_series，否则 reasoning_content 会被丢弃，下游可能报 'Error: No assistant messages found'。",
+
+    "_example_claude-via-deepseek-reasoner": {
+        "_comment": "DeepSeek R1 / Reasoner — 标准 chat 参数 + reasoning 通道。",
+        "mapping_model": "haiku",
+        "provider": "deepseek",
+        "model_series": "deepseek-reasoner",
+        "OPENAI_API_KEY": "sk-DEEPSEEK_KEY_HERE",
+        "OPENAI_BASE_URL": "https://api.deepseek.com/v1",
+        "upstream_model": "deepseek-reasoner"
+    },
+    "_example_claude-via-glm-4-6": {
+        "_comment": "智谱 GLM-4.6 thinking — 标准 chat 参数 + reasoning 通道。",
+        "mapping_model": "opus",
+        "provider": "glm",
+        "model_series": "glm-4.6",
+        "OPENAI_API_KEY": "YOUR_BIGMODEL_KEY",
+        "OPENAI_BASE_URL": "https://open.bigmodel.cn/api/paas/v4",
+        "upstream_model": "glm-4.6"
+    },
+    "_example_claude-via-kimi-k2-thinking": {
+        "_comment": "Moonshot Kimi K2 Thinking — 标准 chat 参数 + reasoning 通道。",
+        "mapping_model": "opus",
+        "provider": "kimi",
+        "model_series": "kimi-k2-thinking",
+        "OPENAI_API_KEY": "sk-YOUR_MOONSHOT_KEY",
+        "OPENAI_BASE_URL": "https://api.moonshot.cn/v1",
+        "upstream_model": "kimi-k2-thinking"
+    },
+    "_example_claude-via-o3": {
+        "_comment": "OpenAI o3 — reasoning profile：max_completion_tokens，不发 temperature/top_p/stop。",
+        "mapping_model": "opus",
+        "provider": "openai",
+        "model_series": "o3",
+        "OPENAI_API_KEY": "sk-YOUR_OPENAI_KEY",
+        "OPENAI_BASE_URL": "https://api.openai.com/v1",
+        "upstream_model": "o3"
+    }
+}
