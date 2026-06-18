@@ -2271,6 +2271,83 @@ class ProxyHTTPRequestHandler(BaseHTTPRequestHandler):
             logger.error("Failed to parse upstream JSON: %s; body[:500]=%s", e, resp_body[:500])
             return self._send_error_response(502, "api_error", "Upstream returned non-JSON body")
 
+        # Symmetric dead-end protection for the non-streaming path.
+        #
+        # The streaming path (`_handle_streaming`) detects two upstream failure
+        # modes and emits a mid-stream `overloaded_error` so Claude Code's SDK
+        # auto-retries:
+        #   1. reasoning-only: finish=stop, no visible content, all output
+        #      tokens spent in `reasoning_content`
+        #   2. empty-tool-args: finish=tool_calls, every tool_call argument
+        #      JSON is "{}" (would trip Invalid tool parameters validation)
+        #
+        # When the SDK falls back to a non-stream request after an SSE error,
+        # this path used to convert these dead-ends into a legal
+        # `[{type:'text', text:''}]` + stop_reason='end_turn' response, which
+        # Claude Code happily treated as "the assistant said nothing, turn is
+        # done" — silently terminating the agent loop.
+        #
+        # Surface them as 529 overloaded_error here so the SDK retries.
+        try:
+            choice = (openai_resp.get("choices") or [{}])[0]
+            msg_obj = choice.get("message") or {}
+            finish_reason = choice.get("finish_reason") or "stop"
+            usage_obj = openai_resp.get("usage") or {}
+            content_field = msg_obj.get("content")
+            if isinstance(content_field, str):
+                visible_text = content_field
+            elif isinstance(content_field, list):
+                visible_text = "".join(
+                    p.get("text", "") for p in content_field
+                    if isinstance(p, dict) and p.get("type") == "text"
+                )
+            else:
+                visible_text = ""
+            tool_calls = msg_obj.get("tool_calls") or []
+            reasoning_text = msg_obj.get("reasoning_content") or ""
+            if isinstance(reasoning_text, list):
+                reasoning_text = "".join(
+                    p.get("text", "") for p in reasoning_text if isinstance(p, dict)
+                )
+            reasoning_only = (
+                finish_reason == "stop"
+                and not visible_text.strip()
+                and not tool_calls
+                and bool(reasoning_text)
+            )
+            empty_tool_args = (
+                finish_reason == "tool_calls"
+                and bool(tool_calls)
+                and all(
+                    (((tc.get("function") or {}).get("arguments") or "").strip()
+                     in ("", "{}"))
+                    for tc in tool_calls
+                )
+            )
+            if reasoning_only or empty_tool_args:
+                kind = "empty_tool_args" if empty_tool_args else "reasoning_only"
+                logger.warning(
+                    "NON_STREAM dead-end model=%s kind=%s finish=%s "
+                    "reasoning_bytes=%d tool_calls=%d completion_tokens=%s — "
+                    "returning 529 overloaded_error so Claude Code retries",
+                    model, kind, finish_reason,
+                    len(reasoning_text.encode("utf-8")),
+                    len(tool_calls),
+                    usage_obj.get("completion_tokens"),
+                )
+                msg_text = (
+                    "Upstream model emitted tool_call envelopes with empty "
+                    "argument JSON ({}); refusing to forward to avoid "
+                    "Invalid tool parameters validation. Treat as transient."
+                ) if empty_tool_args else (
+                    "Upstream model produced only internal reasoning with no "
+                    "visible output (reasoning-only dead-end). Treat as "
+                    "transient and retry."
+                )
+                return self._send_error_response(529, "overloaded_error", msg_text)
+        except Exception as _de:
+            logger.warning("non_stream dead-end check failed: %s", _de)
+
         anthropic_resp = openai_response_to_anthropic(openai_resp, model)
         try:
             self._send_json_response(200, anthropic_resp)
@@ -2716,23 +2793,51 @@ class ProxyHTTPRequestHandler(BaseHTTPRequestHandler):
             reasoning_only_dead_end = False
             try:
                 summary_pre = stream_converter.summary()
-                if (
+                tool_arg_pre = summary_pre.get("tool_arg_bytes") or {}
+                # Two failure modes share the same fix (emit overloaded_error
+                # so Claude Code's SDK auto-retries the request):
+                #   1. reasoning-only: text=0, tools=[], reasoning>0, finish=stop
+                #   2. empty-tool-args: finish=tool_calls, every tool_call's
+                #      accumulated argument JSON is "{}" (<=2 bytes). Forwarding
+                #      this verbatim triggers Claude Code's
+                #      "Invalid tool parameters: required parameter X is missing"
+                #      validation error, which is fatal to the agent loop.
+                reasoning_only = (
                     summary_pre.get("text_bytes", 0) == 0
                     and not summary_pre.get("tool_names")
                     and summary_pre.get("reasoning_bytes", 0) > 0
                     and (stream_converter.finish_reason or finish_reason) == "stop"
-                ):
+                )
+                empty_tool_args = (
+                    bool(summary_pre.get("tool_names"))
+                    and bool(tool_arg_pre)
+                    and all(v <= 2 for v in tool_arg_pre.values())
+                    and summary_pre.get("reasoning_bytes", 0) > 0
+                    and (stream_converter.finish_reason or finish_reason) == "tool_calls"
+                )
+                if reasoning_only or empty_tool_args:
                     reasoning_only_dead_end = True
+                    if empty_tool_args:
+                        msg = (
+                            "Upstream model emitted tool_call envelopes with "
+                            "empty argument JSON ({}). Forwarding would trigger "
+                            "Claude Code's Invalid tool parameters validation. "
+                            "Treat as transient and retry."
+                        )
+                        dead_end_kind = "empty_tool_args"
+                    else:
+                        msg = (
+                            "Upstream model produced only internal "
+                            "reasoning with no visible output (reasoning-"
+                            "only dead-end). Treat as transient and "
+                            "retry."
+                        )
+                        dead_end_kind = "reasoning_only"
                     err_payload = json.dumps({
                         "type": "error",
                         "error": {
                             "type": "overloaded_error",
-                            "message": (
-                                "Upstream model produced only internal "
-                                "reasoning with no visible output (reasoning-"
-                                "only dead-end). Treat as transient and "
-                                "retry."
-                            ),
+                            "message": msg,
                         },
                     }, ensure_ascii=False)
                     try:
@@ -2742,12 +2847,16 @@ class ProxyHTTPRequestHandler(BaseHTTPRequestHandler):
                         client_gone = True
                     logger.warning(
                         "STREAM_CONVERT reasoning_only_dead_end request_id=%s "
-                        "reasoning_bytes=%d attempts=%d — emitted "
+                        "kind=%s reasoning_bytes=%d tool_names=%s "
+                        "tool_arg_bytes=%s attempts=%d — emitted "
                         "overloaded_error so Claude Code auto-retries",
-                        request_id, summary_pre.get("reasoning_bytes", 0),
+                        request_id, dead_end_kind,
+                        summary_pre.get("reasoning_bytes", 0),
+                        summary_pre.get("tool_names") or [],
+                        tool_arg_pre,
                         attempt,
                     )
-                    exit_reason = "reasoning_only_dead_end"
+                    exit_reason = "reasoning_only_dead_end:%s" % dead_end_kind
             except Exception as _fb_e:
                 logger.warning(
                     "reasoning_only_dead_end handler failed request_id=%s: %s",
