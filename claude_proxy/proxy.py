@@ -22,7 +22,7 @@ import sys
 import threading
 import time
 from datetime import datetime, timezone
-from http.server import HTTPServer, BaseHTTPRequestHandler
+from http.server import HTTPServer, ThreadingHTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
 from urllib.parse import urlparse, parse_qs
 
@@ -493,6 +493,277 @@ _TOOL_DIAG_ENABLED = os.environ.get("CLAUDE_PROXY_TOOL_DIAG", "1").lower() not i
     "0", "false", "no", "off"
 }
 
+# Optional auto-repair for known model-side tool-input schema mistakes.
+#
+# HISTORY / WARNING:
+# This rewriter was introduced (2026-06-26) to patch `AskUserQuestion`
+# tool_use inputs that were missing the `question` field. It is DISABLED BY
+# DEFAULT (2026-06-29) because in production it caused worse problems than it
+# fixed: when other content blocks (`thinking`, non-AskUserQuestion `tool_use`)
+# interleaved with the patched block, the SSE-state-machine occasionally
+# dropped legitimate content blocks, producing assistant messages with
+# `stop_reason="tool_use"` but no tool_use content — which permanently breaks
+# the conversation. The Anthropic protocol is byte-transparent; rewriting
+# upstream responses is the wrong layer to repair model misbehaviour.
+#
+# Set CLAUDE_PROXY_TOOL_REPAIR=1 to re-enable for investigation only.
+_TOOL_INPUT_REPAIR_ENABLED = os.environ.get(
+    "CLAUDE_PROXY_TOOL_REPAIR", "0"
+).lower() not in {"0", "false", "no", "off"}
+
+# Optional raw request/response capture for proxy-vs-direct comparison.
+# When CLAUDE_PROXY_CAPTURE_DIR is set, each streaming request dumps:
+#   <dir>/<ts>-<reqid>.req.json       — the raw request body bytes
+#   <dir>/<ts>-<reqid>.req-headers.json — forwarded headers (auth masked)
+#   <dir>/<ts>-<reqid>.upstream.sse   — raw upstream SSE bytes (pre-rewriter)
+#   <dir>/<ts>-<reqid>.target.txt     — target URL
+# This is a *diagnostic only* feature: capture happens at the byte boundary
+# the proxy actually forwards/receives. To reproduce against the upstream
+# directly, use bin/replay_capture.sh <capture-dir>/<prefix>.
+_CAPTURE_DIR = os.environ.get("CLAUDE_PROXY_CAPTURE_DIR", "").strip() or None
+if _CAPTURE_DIR:
+    try:
+        os.makedirs(_CAPTURE_DIR, exist_ok=True)
+    except Exception:
+        _CAPTURE_DIR = None
+
+_PATCHABLE_TOOLS = {"AskUserQuestion"}
+
+
+# ── XML-as-text tool-call leak guard (B+C from incident 2026-06-29) ──────────
+#
+# Observed pattern: claude-opus-4-8 occasionally emits its tool call as a
+# plain `text` content block containing literal XML, e.g.
+#     <invoke name="Bash">
+#       <parameter name="command">...</parameter>
+#     </invoke>
+# instead of a proper `tool_use` content block. Because the proxy is byte-
+# transparent, Claude Code receives the text as user-visible output and the
+# tool never runs. Once a single XML-leak text block lands in the session
+# history, the model is in-context-learning-primed to repeat the same XML
+# pattern on subsequent turns — a self-poisoning feedback loop.
+#
+# Two-part mitigation:
+#   C) ALWAYS count leaks per request and log a structured warning. This
+#      gives us visibility without changing bytes.
+#   B) When CLAUDE_PROXY_XML_LEAK_GUARD is enabled (default ON), abort the
+#      stream the moment we detect the leak by injecting an SSE `error` +
+#      `message_stop` frame using error type `overloaded_error`. Claude Code
+#      treats that as a transient upstream issue and retries the same
+#      request, which empirically succeeds ~98% of the time. The injection
+#      reuses the exact same idle-timeout pattern already proven safe in
+#      `_handle_streaming_forward`.
+#
+# Safety:
+#   * Guard only fires for `text_delta` events. Thinking/tool_use blocks
+#     are untouched.
+#   * The detection window is the *accumulated* text of a single text
+#     content block; we never look across blocks. Once a block stops, its
+#     accumulator is cleared.
+#   * If `<invoke name=` is detected, the offending line is NOT forwarded,
+#     and no further upstream bytes are forwarded either.
+#   * The synthetic error is only emitted if the proxy hasn't already
+#     forwarded a `message_stop` (it can't have, because detection happens
+#     mid-stream before message_stop).
+#   * Disable with CLAUDE_PROXY_XML_LEAK_GUARD=0 to fall back to pure
+#     observability (C only).
+_XML_LEAK_GUARD_ENABLED = os.environ.get(
+    "CLAUDE_PROXY_XML_LEAK_GUARD", "1"
+).lower() not in {"0", "false", "no", "off"}
+
+
+class XmlLeakGuard:
+    """Detect XML-as-text tool-call leak in an Anthropic SSE stream.
+
+    Usage:
+        guard = XmlLeakGuard(model)
+        for line in upstream:
+            verdict = guard.inspect(line)
+            if verdict.drop_line:
+                # Do not forward this line.
+                if verdict.should_abort:
+                    write_synthetic_overloaded_and_stop()
+                    break
+            else:
+                forward(line)
+
+    The class is stateful per stream: instantiate one per request.
+    """
+
+    # Tokens that unambiguously indicate the model has switched into XML
+    # tool-call format inside a `text` content block. We match on the
+    # accumulated text of the current block, so partial sequences like
+    # "<invoke" arriving across multiple deltas still trigger.
+    _TRIGGER = "<invoke name="
+    # Keep the per-block accumulator bounded: if the model produces a huge
+    # benign text block, we don't want to balloon memory.
+    _MAX_ACCUM = 4096
+
+    def __init__(self, model):
+        self.model = model
+        # idx -> accumulated text for blocks of type=text. Other block
+        # types are not tracked.
+        self._text_acc = {}
+        # Once tripped, every subsequent inspect() drops the line so we
+        # don't leak any more upstream bytes downstream.
+        self._tripped = False
+        self._trip_info = None  # dict for logging
+
+    # ── public API ──────────────────────────────────────────────────
+    def inspect(self, line):
+        """Inspect one upstream SSE line. Return an _XmlGuardVerdict."""
+        if self._tripped:
+            # Already tripped — silently drop remaining lines. The caller
+            # will have written the synthetic stop already.
+            return _XmlGuardVerdict(drop_line=True, should_abort=False)
+
+        # Only parse `data:` payloads. event:/blank lines are harmless.
+        if not line or not line.startswith(b"data:"):
+            return _XmlGuardVerdict(drop_line=False, should_abort=False)
+        try:
+            payload = line[len(b"data:"):].strip()
+            if not payload:
+                return _XmlGuardVerdict(drop_line=False, should_abort=False)
+            data = json.loads(payload)
+        except Exception:
+            return _XmlGuardVerdict(drop_line=False, should_abort=False)
+
+        typ = data.get("type")
+        if typ == "content_block_start":
+            idx = data.get("index")
+            block = data.get("content_block") or {}
+            if block.get("type") == "text":
+                self._text_acc[idx] = ""
+            return _XmlGuardVerdict(drop_line=False, should_abort=False)
+
+        if typ == "content_block_stop":
+            idx = data.get("index")
+            self._text_acc.pop(idx, None)
+            return _XmlGuardVerdict(drop_line=False, should_abort=False)
+
+        if typ == "content_block_delta":
+            idx = data.get("index")
+            if idx not in self._text_acc:
+                return _XmlGuardVerdict(drop_line=False, should_abort=False)
+            delta = data.get("delta") or {}
+            if delta.get("type") != "text_delta":
+                return _XmlGuardVerdict(drop_line=False, should_abort=False)
+            chunk = delta.get("text") or ""
+            if not chunk:
+                return _XmlGuardVerdict(drop_line=False, should_abort=False)
+            acc = self._text_acc[idx] + chunk
+            # Bound memory.
+            if len(acc) > self._MAX_ACCUM:
+                acc = acc[-self._MAX_ACCUM:]
+            self._text_acc[idx] = acc
+            if self._TRIGGER in acc:
+                self._tripped = True
+                # Snippet for log (avoid logging huge prompts).
+                hit = acc.find(self._TRIGGER)
+                snippet = acc[max(0, hit - 40): hit + 200]
+                self._trip_info = {
+                    "block_index": idx,
+                    "accum_len": len(acc),
+                    "snippet": snippet,
+                }
+                return _XmlGuardVerdict(drop_line=True, should_abort=True)
+
+        return _XmlGuardVerdict(drop_line=False, should_abort=False)
+
+    @property
+    def tripped(self):
+        return self._tripped
+
+    @property
+    def trip_info(self):
+        return self._trip_info
+
+
+class _XmlGuardVerdict:
+    """Return value from XmlLeakGuard.inspect()."""
+    __slots__ = ("drop_line", "should_abort")
+
+    def __init__(self, drop_line, should_abort):
+        self.drop_line = drop_line
+        self.should_abort = should_abort
+
+
+def _repair_tool_input(name, inp):
+    """Apply known schema-fix rules to a tool_use input dict in-place.
+
+    Returns the (possibly mutated) input dict, plus a list of human-readable
+    patch tags for logging. The input is mutated in place when possible so
+    callers can also keep the original reference if they want.
+    """
+    patches = []
+    if not isinstance(inp, dict):
+        return inp, patches
+
+    if name == "AskUserQuestion":
+        questions = inp.get("questions")
+        if isinstance(questions, list):
+            for i, q in enumerate(questions):
+                if not isinstance(q, dict):
+                    continue
+                if not q.get("question"):
+                    header = q.get("header") or ""
+                    fallback = header.strip() if isinstance(header, str) else ""
+                    if not fallback:
+                        fallback = "请选择"
+                    # Ensure it reads like a question. Strip trailing colons,
+                    # then append a question mark if absent.
+                    fallback = fallback.rstrip(":：?？")
+                    if not fallback.endswith(("?", "？")):
+                        fallback = fallback + "？"
+                    q["question"] = fallback
+                    patches.append(f"questions[{i}].question<-header")
+    return inp, patches
+
+
+def _repair_non_stream_body(resp_body):
+    """Apply _repair_tool_input to a non-streaming Anthropic /v1/messages
+    response. Best-effort: any decode/parse/serialize failure returns the
+    original bytes unchanged."""
+    try:
+        text = resp_body.decode("utf-8")
+    except Exception:
+        return resp_body
+    try:
+        obj = json.loads(text)
+    except Exception:
+        return resp_body
+    if not isinstance(obj, dict):
+        return resp_body
+    content = obj.get("content")
+    if not isinstance(content, list):
+        return resp_body
+    total_patches = []
+    for block in content:
+        if not isinstance(block, dict):
+            continue
+        if block.get("type") != "tool_use":
+            continue
+        name = block.get("name")
+        if name not in _PATCHABLE_TOOLS:
+            continue
+        inp = block.get("input")
+        repaired, patches = _repair_tool_input(name, inp)
+        if patches:
+            block["input"] = repaired
+            total_patches.append((name, block.get("id"), patches))
+    if not total_patches:
+        return resp_body
+    try:
+        new_bytes = json.dumps(obj, ensure_ascii=False).encode("utf-8")
+    except Exception:
+        return resp_body
+    for name, tool_id, patches in total_patches:
+        logger.info(
+            "TOOL_REPAIR patched (non-stream) name=%s id=%s patches=%s",
+            name, tool_id, patches,
+        )
+    return new_bytes
+
 
 class StreamToolDiagnostics:
     """Parse already-forwarded Anthropic SSE lines and log tool-use integrity.
@@ -668,6 +939,204 @@ class StreamToolDiagnostics:
 # Claude Code and the upstream Wanqing Claude API speak the same protocol, so
 # response-body transparency is the root invariant of this proxy. Keep any
 # response inspection diagnostic-only.
+#
+# Exception: when CLAUDE_PROXY_TOOL_REPAIR is on, the rewriter below patches a
+# small, allow-listed set of known-bad model outputs (see _PATCHABLE_TOOLS and
+# _repair_tool_input). All other bytes are forwarded byte-for-byte.
+
+
+class StreamToolInputRewriter:
+    """Stream-time repair for known broken tool_use inputs.
+
+    Strategy per SSE event:
+      * `message_start`, `ping`, `text_delta`, `message_delta`, `message_stop`,
+        comments, and any non-tool-use content blocks → forward as-is.
+      * `content_block_start` with `tool_use` whose name is in
+        `_PATCHABLE_TOOLS` → forward as-is, mark this index as "interested",
+        and start buffering its `input_json_delta` lines.
+      * `content_block_delta` on a buffered index → BUFFER, do not forward.
+      * `content_block_stop` on a buffered index → try to parse the buffered
+        partial JSON, repair it, then emit a SINGLE synthetic
+        `input_json_delta` carrying the full repaired JSON, immediately
+        followed by the original `content_block_stop`. If parse fails or no
+        patches needed, flush the buffered deltas verbatim.
+      * For non-interested indexes everything passes through untouched.
+
+    Output is a list of `bytes` lines (already terminated with `\\n`).
+    """
+
+    def __init__(self, model):
+        self.model = model
+        self.event = None         # current SSE `event:` line value
+        self.data_lines = []      # current SSE `data:` payload accumulator (raw)
+        self.raw_lines = []       # raw bytes for the current event, in case
+                                  # we need to forward it verbatim
+        # Per-block state: blocks[index] = {"name", "buffered": [bytes],
+        # "partial_json": str, "active": bool}
+        self.blocks = {}
+        self._last_consumed = False
+
+    # ── public API ───────────────────────────────────────────────────────
+    def feed(self, line):
+        """Consume one upstream SSE line. Returns a list of bytes lines to
+        emit to Claude Code (may be empty, may be more than one)."""
+        if not _TOOL_INPUT_REPAIR_ENABLED:
+            return [line]
+        try:
+            text = line.decode("utf-8", errors="replace")
+        except Exception:
+            return [line]
+
+        stripped = text.rstrip("\r\n")
+        # SSE comment / keep-alive — pass through, not part of any event.
+        if stripped.startswith(":"):
+            return [line]
+
+        # Blank line terminates an event.
+        if not stripped:
+            out = self._finish_event()
+            # Always forward the blank terminator unless the event was
+            # entirely consumed (buffered). If buffered, the blank line
+            # still needs to be suppressed so we don't break SSE framing
+            # on the client side for an event that was never emitted.
+            if self._last_consumed:
+                return out
+            return out + [line]
+
+        if stripped.startswith("event:"):
+            self.event = stripped[len("event:"):].strip()
+            self.raw_lines.append(line)
+            return []
+        if stripped.startswith("data:"):
+            self.data_lines.append(stripped[len("data:"):].lstrip())
+            self.raw_lines.append(line)
+            return []
+
+        # Unknown line — forward verbatim and reset framing state.
+        self.event = None
+        self.data_lines = []
+        self.raw_lines = []
+        return [line]
+
+    # ── internals ────────────────────────────────────────────────────────
+    def _finish_event(self):
+        self._last_consumed = False
+        raw_lines = self.raw_lines
+        data_lines = self.data_lines
+        event = self.event
+        self.event = None
+        self.data_lines = []
+        self.raw_lines = []
+
+        if not data_lines:
+            return []
+        raw_data = "\n".join(data_lines)
+        try:
+            data = json.loads(raw_data)
+        except Exception:
+            return raw_lines  # malformed JSON — forward as-is
+
+        typ = data.get("type") or event
+
+        if typ == "content_block_start":
+            idx = data.get("index")
+            block = data.get("content_block") or {}
+            if (
+                block.get("type") == "tool_use"
+                and block.get("name") in _PATCHABLE_TOOLS
+            ):
+                self.blocks[idx] = {
+                    "name": block.get("name"),
+                    "buffered": [],
+                    "partial_json": "",
+                    "active": True,
+                }
+            return raw_lines
+
+        if typ == "content_block_delta":
+            idx = data.get("index")
+            rec = self.blocks.get(idx)
+            if rec and rec.get("active"):
+                delta = data.get("delta") or {}
+                if delta.get("type") == "input_json_delta":
+                    rec["buffered"].extend(raw_lines)
+                    # Preserve the blank-line terminator for this event so a
+                    # later verbatim flush reproduces correct SSE framing.
+                    rec["buffered"].append(b"\n")
+                    rec["partial_json"] += delta.get("partial_json") or ""
+                    self._last_consumed = True
+                    return []
+                # Non-input_json_delta on a tool_use block (unexpected for
+                # tool_use, but possible) — flush buffer first, then forward.
+                flushed = rec["buffered"]
+                rec["buffered"] = []
+                return flushed + raw_lines
+            return raw_lines
+
+        if typ == "content_block_stop":
+            idx = data.get("index")
+            rec = self.blocks.pop(idx, None)
+            if rec and rec.get("active"):
+                return self._finalize_block(idx, rec, raw_lines)
+            return raw_lines
+
+        return raw_lines
+
+    def _finalize_block(self, idx, rec, stop_lines):
+        partial = rec.get("partial_json") or ""
+        buffered = rec.get("buffered") or []
+        name = rec.get("name")
+
+        if not partial:
+            # No deltas at all — nothing to repair, just forward stop.
+            return stop_lines
+
+        try:
+            obj = json.loads(partial)
+        except Exception as exc:
+            logger.warning(
+                "TOOL_REPAIR parse_fail model=%s index=%s name=%s err=%s len=%d; "
+                "forwarding original deltas",
+                self.model, idx, name, type(exc).__name__, len(partial),
+            )
+            return buffered + stop_lines
+
+        repaired, patches = _repair_tool_input(name, obj)
+        if not patches:
+            # Schema looks fine — pass through unchanged.
+            return buffered + stop_lines
+
+        try:
+            new_json = json.dumps(repaired, ensure_ascii=False)
+        except Exception as exc:
+            logger.warning(
+                "TOOL_REPAIR serialize_fail model=%s index=%s name=%s err=%s; "
+                "forwarding original deltas",
+                self.model, idx, name, type(exc).__name__,
+            )
+            return buffered + stop_lines
+
+        synthetic = {
+            "type": "content_block_delta",
+            "index": idx,
+            "delta": {
+                "type": "input_json_delta",
+                "partial_json": new_json,
+            },
+        }
+        synthetic_lines = (
+            b"event: content_block_delta\n"
+            + b"data: "
+            + json.dumps(synthetic, ensure_ascii=False).encode("utf-8")
+            + b"\n"
+        )
+        logger.info(
+            "TOOL_REPAIR patched model=%s index=%s name=%s patches=%s "
+            "orig_len=%d new_len=%d",
+            self.model, idx, name, patches, len(partial), len(new_json),
+        )
+        # Emit: synthetic delta line, blank terminator, then original stop.
+        return [synthetic_lines, b"\n"] + stop_lines
 
 
 def summarize_request_tools(body):
@@ -1156,6 +1625,11 @@ class ProxyHTTPRequestHandler(BaseHTTPRequestHandler):
             method, target_base, target_path, headers, body, stream=False,
         )
 
+        # Best-effort repair of known-broken tool_use inputs in non-streaming
+        # responses. Mirrors StreamToolInputRewriter for the streaming path.
+        if _TOOL_INPUT_REPAIR_ENABLED and resp_body:
+            resp_body = _repair_non_stream_body(resp_body)
+
         try:
             self.send_response(status)
             for key, value in resp_headers.items():
@@ -1195,6 +1669,38 @@ class ProxyHTTPRequestHandler(BaseHTTPRequestHandler):
         status, resp_headers, response, conn = forward_request(
             method, target_base, target_path, headers, body, stream=True,
         )
+
+        # ── Optional raw capture for proxy-vs-direct comparison ──────────
+        capture_files = None  # tuple of (req_path, hdr_path, sse_path, tgt_path, sse_fp)
+        if _CAPTURE_DIR:
+            try:
+                import uuid
+                ts = time.strftime("%Y%m%dT%H%M%S")
+                reqid = uuid.uuid4().hex[:8]
+                prefix = os.path.join(_CAPTURE_DIR, f"{ts}-{reqid}")
+                req_p = prefix + ".req.json"
+                hdr_p = prefix + ".req-headers.json"
+                sse_p = prefix + ".upstream.sse"
+                tgt_p = prefix + ".target.txt"
+                with open(req_p, "wb") as fp:
+                    fp.write(body or b"")
+                masked = {}
+                for k, v in headers.items():
+                    if k.lower() in ("authorization", "x-api-key"):
+                        sv = str(v)
+                        masked[k] = (sv[:8] + "...REDACTED..." + sv[-4:]) if len(sv) > 16 else "REDACTED"
+                    else:
+                        masked[k] = v
+                with open(hdr_p, "w") as fp:
+                    json.dump(masked, fp, ensure_ascii=False, indent=2)
+                with open(tgt_p, "w") as fp:
+                    fp.write(f"{method} {target_base}{target_path}\n")
+                sse_fp = open(sse_p, "wb")
+                capture_files = (req_p, hdr_p, sse_p, tgt_p, sse_fp)
+                logger.info("CAPTURE saved prefix=%s", prefix)
+            except Exception as e:
+                logger.warning("CAPTURE setup failed: %s", e)
+                capture_files = None
 
         logger.info("Upstream stream response: status=%s", status)
         if status >= 400:
@@ -1267,6 +1773,12 @@ class ProxyHTTPRequestHandler(BaseHTTPRequestHandler):
                     if not line:
                         line_queue.put(("eof", None))
                         return
+                    if capture_files:
+                        try:
+                            capture_files[4].write(line)
+                            capture_files[4].flush()
+                        except Exception:
+                            pass
                     try:
                         line_queue.put(("data", line), timeout=5)
                     except queue.Full:
@@ -1294,6 +1806,8 @@ class ProxyHTTPRequestHandler(BaseHTTPRequestHandler):
         first_event_at = None
         last_err = None
         tool_diag = StreamToolDiagnostics(model)
+        tool_rewriter = StreamToolInputRewriter(model)
+        xml_guard = XmlLeakGuard(model)
 
         def _write_upstream_line(line):
             """Write exactly one upstream SSE line to Claude Code.
@@ -1301,12 +1815,17 @@ class ProxyHTTPRequestHandler(BaseHTTPRequestHandler):
             The proxy's default contract is transparent Anthropic-protocol
             forwarding. Diagnostics may parse a copy of the line, but must never
             rewrite, buffer, synthesize, or drop upstream response bytes.
+
+            Exception: when CLAUDE_PROXY_TOOL_REPAIR is on, the rewriter may
+            buffer `input_json_delta` lines for known-broken tools and emit a
+            patched delta at `content_block_stop`. See StreamToolInputRewriter.
             """
             nonlocal bytes_streamed, line_count
-            self.wfile.write(line)
+            for out_line in tool_rewriter.feed(line):
+                self.wfile.write(out_line)
+                bytes_streamed += len(out_line)
+                line_count += 1
             self.wfile.flush()
-            bytes_streamed += len(line)
-            line_count += 1
 
         try:
             while True:
@@ -1321,6 +1840,69 @@ class ProxyHTTPRequestHandler(BaseHTTPRequestHandler):
                 if kind == "data":
                     line = payload
                     tool_diag.feed(line)
+                    # ── XML-as-text tool-call leak guard (C: always log; B: optional abort)
+                    verdict = xml_guard.inspect(line)
+                    if verdict.drop_line:
+                        if verdict.should_abort:
+                            # First detection — log loudly and decide whether
+                            # to actually abort the stream.
+                            info = xml_guard.trip_info or {}
+                            logger.warning(
+                                "XML_LEAK detected model=%s block_index=%s accum_len=%s "
+                                "guard_enabled=%s snippet=%r",
+                                model, info.get("block_index"),
+                                info.get("accum_len"),
+                                _XML_LEAK_GUARD_ENABLED,
+                                info.get("snippet"),
+                            )
+                            if _XML_LEAK_GUARD_ENABLED:
+                                # Inject synthetic overloaded_error + message_stop
+                                # so Claude Code's built-in retry kicks in. Reuses
+                                # the exact same shape as the upstream-idle-timeout
+                                # injection path (proven safe).
+                                try:
+                                    err_payload = json.dumps({
+                                        "type": "error",
+                                        "error": {
+                                            "type": "overloaded_error",
+                                            "message": (
+                                                "Upstream emitted a tool call as "
+                                                "XML text instead of a tool_use "
+                                                "block. The proxy aborted the "
+                                                "stream so Claude Code can retry."
+                                            ),
+                                        },
+                                    }, ensure_ascii=False)
+                                    self.wfile.write(b"event: error\n")
+                                    self.wfile.write(
+                                        b"data: " + err_payload.encode("utf-8") + b"\n\n"
+                                    )
+                                    stop_payload = json.dumps({"type": "message_stop"})
+                                    self.wfile.write(b"event: message_stop\n")
+                                    self.wfile.write(
+                                        b"data: " + stop_payload.encode("utf-8") + b"\n\n"
+                                    )
+                                    self.wfile.flush()
+                                except (BrokenPipeError, ConnectionResetError) as e:
+                                    logger.info(
+                                        "Client gone while sending xml-leak abort: %s", e,
+                                    )
+                                    client_gone = True
+                                    last_err = e
+                                except Exception as e:
+                                    logger.warning(
+                                        "Failed to write xml-leak abort frame: %s", e,
+                                    )
+                                exit_reason = "xml_leak_guard"
+                                break
+                            # Guard disabled (C-only mode): just drop the
+                            # offending line but keep streaming. The text
+                            # block is already partially rendered downstream.
+                        # drop_line=True but should_abort=False means we're
+                        # post-trip and silently dropping leftover bytes.
+                        last_data_at = time.monotonic()
+                        last_ping_at = time.monotonic()
+                        continue
                     try:
                         _write_upstream_line(line)
                     except (BrokenPipeError, ConnectionResetError) as e:
@@ -1471,6 +2053,12 @@ class ProxyHTTPRequestHandler(BaseHTTPRequestHandler):
                 pass
             # Don't block server thread on join; reader is daemon.
             reader_thread.join(timeout=0.5)
+            # Close the capture sink (if any).
+            if capture_files:
+                try:
+                    capture_files[4].close()
+                except Exception:
+                    pass
 
     def _route_by_default_model(self, path):
         """Route a request using the default (first) model."""
@@ -1497,6 +2085,8 @@ class ProxyHTTPRequestHandler(BaseHTTPRequestHandler):
             status, resp_headers, resp_body = forward_request(
                 self.command, target_base, target_path, fwd_headers, body, stream=False,
             )
+            if _TOOL_INPUT_REPAIR_ENABLED and resp_body:
+                resp_body = _repair_non_stream_body(resp_body)
             self.send_response(status)
             for key, value in resp_headers.items():
                 kl = key.lower()
@@ -1652,9 +2242,18 @@ def run_server(host="0.0.0.0", port=8080, config_path="config.json"):
         else:
             logger.warning("Claude settings sync skipped: %s", sync_info.get("error"))
 
-    server = HTTPServer((host, port), ProxyHTTPRequestHandler)
+    # Use ThreadingHTTPServer so a single long-running upstream request
+    # (e.g. a 5-minute 504 retry chain on a non-stream POST) cannot block the
+    # whole proxy. Each incoming connection runs on its own daemon thread,
+    # which is what Claude Code expects from any Anthropic-compatible server.
+    # See incident 2026-06-30 18:26: a stuck non-stream retry chain caused
+    # ConnectionRefused on the TUI because the single accept loop was wedged.
+    server = ThreadingHTTPServer((host, port), ProxyHTTPRequestHandler)
+    # Make sure Python doesn't wait for in-flight handler threads to finish
+    # on Ctrl-C — they may be in a 5-minute upstream wait.
+    server.daemon_threads = True
     logger.info("=" * 60)
-    logger.info("Claude Code API Proxy Server")
+    logger.info("Claude Code API Proxy Server (threaded)")
     logger.info("Listening on http://%s:%d", host, port)
     logger.info("Configuration: %s", os.path.abspath(_config_path))
     logger.info("Endpoints:")
