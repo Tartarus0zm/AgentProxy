@@ -21,6 +21,7 @@ import socket
 import sys
 import threading
 import time
+import uuid
 from datetime import datetime, timezone
 from http.server import HTTPServer, ThreadingHTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
@@ -528,6 +529,90 @@ if _CAPTURE_DIR:
         _CAPTURE_DIR = None
 
 _PATCHABLE_TOOLS = {"AskUserQuestion"}
+
+
+# ── DeepSeek anthropic-compat adapter (2026-07-20) ────────────────────────────
+#
+# DeepSeek's anthropic-compatible layer (endpoint ep-pjzax9) has two failure
+# modes that leave Claude Code with a visually "empty" assistant turn:
+#
+# 1. DSML tool-call leak — the model emits its NATIVE tool-call syntax
+#      <｜DSML｜tool_calls>
+#        <｜DSML｜invoke name="Bash">
+#          <｜DSML｜parameter name="command" string="true">ls</｜DSML｜parameter>
+#        </｜DSML｜invoke>
+#      </｜DSML｜tool_calls>
+#    inside a `thinking` or `text` content block (character "｜" is U+FF5C
+#    FULLWIDTH VERTICAL LINE). The Anthropic compat layer does NOT convert
+#    those tokens into a proper `tool_use` content block. Result:
+#      * If leaked into `text`: Claude Code renders the raw XML/DSML to the
+#        user, tool never runs.
+#      * If leaked into `thinking`: Claude Code hides `thinking` from the UI,
+#        so the user sees a blank assistant turn. Worse, the model may report
+#        `stop_reason="stop_sequence"` because some DSML token collided with
+#        an internal stop marker.
+#
+# 2. Thinking-only turn — the model puts its ENTIRE user-facing response
+#    inside `thinking` and emits an empty `text` block (or no text block at
+#    all), then `stop_reason="end_turn"`. Claude Code UI shows nothing.
+#
+# Both are handled by DeepseekStreamAdapter. Correctness invariants:
+#
+#   * The adapter NEVER mutates upstream bytes. It only APPENDS synthetic
+#     content blocks at the tail of the stream, immediately before
+#     `message_delta`. This preserves any thinking-block `signature` that
+#     upstream will validate on the next request.
+#
+#   * The adapter only activates when the request model matches a
+#     configurable prefix (default: "deepseek"). Non-DeepSeek streams are
+#     forwarded byte-for-byte.
+#
+#   * The adapter uses a passive observer + delayed-emit pattern: every
+#     upstream line is forwarded verbatim UNTIL `event: message_delta` is
+#     seen. At that point, the adapter decides whether to inject synthetic
+#     blocks BEFORE forwarding `message_delta` (and optionally rewrites
+#     `message_delta.delta.stop_reason` when tool_use was synthesized).
+#
+#   * All injected blocks use fresh indices strictly greater than any index
+#     upstream used. This guarantees Claude Code's block-index bookkeeping
+#     is not confused.
+#
+#   * Disable with CLAUDE_PROXY_DEEPSEEK_ADAPTER=0 (default is 1 for deepseek
+#     models only; other models are never touched regardless).
+#
+# History of pitfalls this design avoids:
+#   * StreamToolInputRewriter (2026-06-26) rewrote existing content_blocks
+#     mid-flight and caused SSE-state-machine desync with dropped legit
+#     blocks. Fix: this adapter never rewrites existing blocks; it only
+#     appends new ones at the tail.
+#   * Anthropic thinking-signature validation (2026-07-13) fails if
+#     `thinking.thinking` text or `signature` field is modified. Fix: this
+#     adapter never touches thinking blocks — it appends a NEW visible-text
+#     block whose input is derived from thinking, without modifying the
+#     signed original.
+#   * ThreadingHTTPServer daemon threads (2026-06-30) — the adapter is
+#     purely per-request state, no shared mutable globals. Thread-safe.
+
+_DEEPSEEK_ADAPTER_ENABLED = os.environ.get(
+    "CLAUDE_PROXY_DEEPSEEK_ADAPTER", "1"
+).lower() not in {"0", "false", "no", "off"}
+# Model-name prefix that activates the adapter. Empty string = never
+# activate. Comma-separated list allowed.
+_DEEPSEEK_MODEL_PREFIXES = tuple(
+    p.strip().lower()
+    for p in os.environ.get("CLAUDE_PROXY_DEEPSEEK_MODELS", "deepseek").split(",")
+    if p.strip()
+)
+# Enable Phase-2 thinking-only fallback (inject a synthetic text block
+# summarising thinking if the model emitted no visible text). Off by default
+# because it changes assistant content; users may prefer to just retry.
+_DEEPSEEK_THINKING_FALLBACK = os.environ.get(
+    "CLAUDE_PROXY_DEEPSEEK_THINKING_FALLBACK", "0"
+).lower() not in {"0", "false", "no", "off"}
+# Maximum characters of thinking text to expose in the fallback text block.
+_DEEPSEEK_THINKING_FALLBACK_MAX = int(
+    os.environ.get("CLAUDE_PROXY_DEEPSEEK_THINKING_FALLBACK_MAX", "1200") or "1200"
+)
 
 
 # ── XML-as-text tool-call leak guard (B+C from incident 2026-06-29) ──────────
@@ -1137,6 +1222,448 @@ class StreamToolInputRewriter:
         )
         # Emit: synthetic delta line, blank terminator, then original stop.
         return [synthetic_lines, b"\n"] + stop_lines
+
+
+# ── DeepSeek anthropic-compat stream adapter (2026-07-20) ────────────────────
+#
+# See design notes near _DEEPSEEK_ADAPTER_ENABLED above for full context.
+#
+# Placement: this adapter runs AFTER XmlLeakGuard and AFTER StreamToolInputRewriter
+# in the write path — see _write_upstream_line() in do_POST. It observes lines
+# passively (never modifies them) and only INJECTS synthetic lines at the
+# `message_delta` boundary. This layering guarantees:
+#   * XmlLeakGuard still fires on Opus XML leaks (unrelated code path).
+#   * StreamToolInputRewriter still repairs AskUserQuestion (its rewrite is
+#     applied before the adapter sees the line, so DSML detection sees the
+#     final byte stream that Claude Code would have seen).
+#   * The adapter cannot double-fire on `<invoke name="...">` XML leaks
+#     because it only matches the DSML-specific token `<｜DSML｜`.
+#
+# The character `｜` is U+FF5C FULLWIDTH VERTICAL LINE (3 bytes UTF-8:
+# 0xEF 0xBD 0x9C). We match on the literal Unicode string in decoded text.
+
+
+# Regex for DSML tool_calls block. Non-greedy match up to </｜DSML｜invoke>
+# so each individual invoke is captured separately.
+_DSML_INVOKE_RE = re.compile(
+    r"<｜DSML｜invoke\s+name=\"([^\"]+)\"[^>]*>(.*?)</｜DSML｜invoke>",
+    re.DOTALL,
+)
+_DSML_PARAM_RE = re.compile(
+    r"<｜DSML｜parameter\s+name=\"([^\"]+)\"(?:\s+[^>]*)?>(.*?)</｜DSML｜parameter>",
+    re.DOTALL,
+)
+# Cheap sentinel for "does this string contain any DSML at all?" — much
+# faster than running the full regex on every accumulated block.
+_DSML_SENTINEL = "<｜DSML｜"
+
+
+def _parse_dsml_tool_calls(text):
+    """Parse a text/thinking block possibly containing DSML tool_calls.
+
+    Returns a list of {"name": str, "input": dict}. Best-effort: unparseable
+    parameter values are kept as raw strings. Returns [] if no DSML tokens
+    are present or nothing parseable was found.
+
+    We intentionally do NOT try to JSON-parse parameter values here: DeepSeek
+    marks all params `string="true"` so downstream tools (which validate via
+    Anthropic input_schema) will coerce as needed. Passing strings through
+    is safer than mis-guessing types.
+    """
+    if not text or _DSML_SENTINEL not in text:
+        return []
+    calls = []
+    for m in _DSML_INVOKE_RE.finditer(text):
+        name = m.group(1)
+        body = m.group(2) or ""
+        params = {}
+        for pm in _DSML_PARAM_RE.finditer(body):
+            pname = pm.group(1)
+            pval = pm.group(2)
+            # Strip whitespace only at edges; interior newlines are meaningful.
+            params[pname] = pval.strip()
+        if name:
+            calls.append({"name": name, "input": params})
+    return calls
+
+
+def _sse_lines(event_name, data_obj):
+    """Serialize one SSE event as a list[bytes], matching upstream framing.
+
+    Returns [b"event: <name>\n", b"data: <json>\n", b"\n"] — three lines,
+    each newline-terminated, mirroring what upstream sends. The trailing
+    blank line terminates the event per SSE spec.
+    """
+    payload = json.dumps(data_obj, ensure_ascii=False).encode("utf-8")
+    return [
+        ("event: " + event_name + "\n").encode("utf-8"),
+        b"data: " + payload + b"\n",
+        b"\n",
+    ]
+
+
+def _new_tool_use_id():
+    """Fresh tool_use id in Anthropic style. Suffixed with 'proxy' so ops can
+    tell adapter-synthesized ids apart from upstream ids in logs / captures."""
+    return "toolu_proxy_" + uuid.uuid4().hex[:20]
+
+
+def model_needs_deepseek_adapter(model):
+    """Return True iff the request's model triggers DeepseekStreamAdapter.
+
+    Isolated helper so tests can exercise the prefix logic without spinning
+    up the whole class. Case-insensitive prefix match against
+    CLAUDE_PROXY_DEEPSEEK_MODELS (comma-separated).
+    """
+    if not _DEEPSEEK_ADAPTER_ENABLED:
+        return False
+    if not model or not _DEEPSEEK_MODEL_PREFIXES:
+        return False
+    ml = model.lower()
+    return any(ml.startswith(p) for p in _DEEPSEEK_MODEL_PREFIXES)
+
+
+class DeepseekStreamAdapter:
+    """SSE post-processor that repairs DeepSeek anthropic-compat gaps.
+
+    Semantics per feed(line):
+      * If adapter is inactive (non-deepseek model or globally disabled),
+        returns [line] unchanged. Zero-cost fast path.
+      * Otherwise, observes line for state (indices, thinking accumulation,
+        text accumulation, message_delta detection). ALL non-message_delta
+        lines are returned unchanged.
+      * When `event: message_delta` is seen: BEFORE forwarding it, may emit
+        synthetic content_block_start/delta/stop events for tool_use
+        conversions or a fallback text block. The `message_delta` payload
+        itself is REWRITTEN in-place if we synthesized tool_use (changing
+        `stop_reason` to "tool_use") — this is safe because message_delta
+        is a control event, not signed content.
+
+    Design invariants (do NOT change without re-reading the pitfall history):
+      1. Never modify existing content_block_* events. Signatures on
+         thinking blocks must round-trip byte-exact.
+      2. Synthetic block indices start at (max upstream index + 1).
+      3. All synthetic emits are complete (start + delta + stop), never
+         leave a dangling open block that would confuse Claude Code.
+      4. If parse fails at any point, the adapter no-ops (returns [line]).
+    """
+
+    def __init__(self, model):
+        self.model = model
+        self._active = model_needs_deepseek_adapter(model)
+        # Framing state (partial SSE event being assembled).
+        self._pending_event = None       # str or None
+        self._pending_data_lines = []    # list[str]
+        self._pending_raw = []           # list[bytes] to forward verbatim
+        # Per-block content buffers. blocks[idx] = {"type": str, "text": str}
+        self._blocks = {}
+        self._max_idx = -1
+        # Emitted synthetic block indices, so we don't re-emit if adapter
+        # is somehow re-invoked.
+        self._done = False
+        # Counters for diagnostics.
+        self.stats = {
+            "dsml_tool_calls_synthesized": 0,
+            "thinking_fallback_emitted": 0,
+        }
+
+    # ── public API ─────────────────────────────────────────────────────
+    def feed(self, line):
+        """Consume one downstream-bound SSE line, return list[bytes] to emit.
+
+        `line` is what the previous stage (rewriter) chose to forward.
+        Blank / comment lines are pass-through.
+        """
+        if not self._active or self._done:
+            return [line]
+        try:
+            text = line.decode("utf-8", errors="replace")
+        except Exception:
+            return [line]
+
+        stripped = text.rstrip("\r\n")
+
+        # SSE comments (keep-alives) pass through, no framing effect.
+        if stripped.startswith(":"):
+            return [line]
+
+        # Blank line = terminator of current event.
+        if not stripped:
+            out = self._finish_pending_event()
+            return out + [line]
+
+        if stripped.startswith("event:"):
+            self._pending_event = stripped[len("event:"):].strip()
+            self._pending_raw.append(line)
+            return []
+        if stripped.startswith("data:"):
+            self._pending_data_lines.append(stripped[len("data:"):].lstrip())
+            self._pending_raw.append(line)
+            return []
+
+        # Unknown non-framing line — flush any partial event and forward.
+        # This branch is defensive: real Anthropic SSE only has event:/data:/
+        # comment/blank.
+        flushed = self._pending_raw
+        self._pending_event = None
+        self._pending_data_lines = []
+        self._pending_raw = []
+        return flushed + [line]
+
+    def finalize_on_eof(self):
+        """Called if the stream ended without a proper message_stop. Returns
+        any pending event bytes so we don't lose them; adapter injections are
+        NOT applied here because we didn't see message_delta (=> incomplete
+        response, upstream retry is the right recovery, not our synthesis).
+        """
+        if not self._active:
+            return []
+        # Flush any pending partial event verbatim (do not synthesize).
+        if self._pending_raw:
+            flushed = self._pending_raw
+            self._pending_event = None
+            self._pending_data_lines = []
+            self._pending_raw = []
+            return flushed
+        return []
+
+    # ── internals ──────────────────────────────────────────────────────
+    def _finish_pending_event(self):
+        raw = self._pending_raw
+        data_lines = self._pending_data_lines
+        event = self._pending_event
+        self._pending_event = None
+        self._pending_data_lines = []
+        self._pending_raw = []
+
+        if not data_lines:
+            return raw
+
+        raw_data = "\n".join(data_lines)
+        try:
+            data = json.loads(raw_data)
+        except Exception:
+            return raw  # malformed; forward as-is
+
+        typ = data.get("type") or event
+
+        # Observe content blocks.
+        if typ == "content_block_start":
+            idx = data.get("index")
+            if isinstance(idx, int):
+                if idx > self._max_idx:
+                    self._max_idx = idx
+                block = data.get("content_block") or {}
+                self._blocks[idx] = {
+                    "type": block.get("type"),
+                    "text": "",
+                }
+            return raw
+
+        if typ == "content_block_delta":
+            idx = data.get("index")
+            rec = self._blocks.get(idx) if isinstance(idx, int) else None
+            if rec is not None:
+                delta = data.get("delta") or {}
+                dtyp = delta.get("type")
+                if dtyp == "text_delta":
+                    chunk = delta.get("text") or ""
+                    if chunk:
+                        rec["text"] += chunk
+                elif dtyp == "thinking_delta":
+                    chunk = delta.get("thinking") or ""
+                    if chunk:
+                        rec["text"] += chunk
+                # Other delta types (input_json_delta, signature_delta,
+                # etc.) don't feed our text accumulators.
+            return raw
+
+        if typ == "content_block_stop":
+            # We keep the block record around so message_delta can inspect it.
+            return raw
+
+        if typ == "message_delta":
+            # Decision point: inspect accumulated blocks, decide whether
+            # to inject synthetic content blocks BEFORE forwarding.
+            injected = self._maybe_inject_before_message_delta(data)
+            if injected:
+                # Rewrite stop_reason if we synthesized tool_use blocks.
+                if self.stats["dsml_tool_calls_synthesized"] > 0:
+                    delta_obj = data.get("delta") or {}
+                    old_reason = delta_obj.get("stop_reason")
+                    if old_reason in ("stop_sequence", "end_turn", None):
+                        delta_obj["stop_reason"] = "tool_use"
+                        delta_obj["stop_sequence"] = None
+                        data["delta"] = delta_obj
+                        # Serialize a fresh message_delta line replacing raw.
+                        # NOTE: _sse_lines includes a trailing blank
+                        # terminator, but the caller (feed) will append its
+                        # own blank line (the one that triggered this
+                        # finish). So we drop the terminator here to avoid
+                        # a double blank that would break SSE framing.
+                        raw = _sse_lines("message_delta", data)[:-1]
+                        logger.info(
+                            "DEEPSEEK_ADAPTER rewrote stop_reason "
+                            "model=%s %r -> tool_use (%d synth tool_uses)",
+                            self.model, old_reason,
+                            self.stats["dsml_tool_calls_synthesized"],
+                        )
+                return injected + raw
+            return raw
+
+        if typ == "message_stop":
+            self._done = True
+            return raw
+
+        return raw
+
+    def _maybe_inject_before_message_delta(self, message_delta_obj):
+        """Look at accumulated blocks and decide what to inject.
+
+        Priority:
+          1. If any thinking/text block contains DSML tool_calls, synthesize
+             `tool_use` blocks for each DSML invoke.
+          2. Else, if fallback is enabled and there is a non-empty thinking
+             block with an empty/absent text block, emit a synthetic text
+             block containing the thinking's first N chars in a
+             <proxy-recovered-from-thinking>...</proxy-recovered-from-thinking>
+             wrapper so Claude Code shows *something*.
+        Returns list[bytes] of synthetic SSE lines, or [] if nothing to do.
+        """
+        out = []
+
+        # ── Phase 1: DSML → tool_use conversion ─────────────────────────
+        dsml_calls = []
+        for idx in sorted(self._blocks):
+            rec = self._blocks[idx]
+            body = rec.get("text") or ""
+            if _DSML_SENTINEL not in body:
+                continue
+            try:
+                calls = _parse_dsml_tool_calls(body)
+            except Exception as e:
+                logger.warning(
+                    "DEEPSEEK_ADAPTER dsml_parse_fail model=%s idx=%s err=%s",
+                    self.model, idx, e,
+                )
+                calls = []
+            if calls:
+                # Sanity cap so a runaway block doesn't spawn 1000 tool_uses.
+                if len(calls) > 8:
+                    logger.warning(
+                        "DEEPSEEK_ADAPTER too_many_dsml_calls model=%s idx=%s "
+                        "count=%d — truncating to 8",
+                        self.model, idx, len(calls),
+                    )
+                    calls = calls[:8]
+                dsml_calls.extend(calls)
+
+        for call in dsml_calls:
+            self._max_idx += 1
+            new_idx = self._max_idx
+            tool_id = _new_tool_use_id()
+            name = call["name"]
+            inp = call.get("input") or {}
+            # content_block_start
+            out += _sse_lines("content_block_start", {
+                "type": "content_block_start",
+                "index": new_idx,
+                "content_block": {
+                    "type": "tool_use",
+                    "id": tool_id,
+                    "name": name,
+                    "input": {},
+                },
+            })
+            # Single full input_json_delta with the whole JSON.
+            try:
+                inp_json = json.dumps(inp, ensure_ascii=False)
+            except Exception:
+                inp_json = "{}"
+            out += _sse_lines("content_block_delta", {
+                "type": "content_block_delta",
+                "index": new_idx,
+                "delta": {
+                    "type": "input_json_delta",
+                    "partial_json": inp_json,
+                },
+            })
+            out += _sse_lines("content_block_stop", {
+                "type": "content_block_stop",
+                "index": new_idx,
+            })
+            self.stats["dsml_tool_calls_synthesized"] += 1
+            logger.info(
+                "DEEPSEEK_ADAPTER dsml_to_tool_use model=%s new_idx=%d "
+                "name=%s input_keys=%s tool_id=%s",
+                self.model, new_idx, name, sorted(inp.keys()), tool_id,
+            )
+
+        if dsml_calls:
+            # Once we've emitted tool_use blocks the request must end with
+            # stop_reason=tool_use. Skip Phase 2 fallback.
+            return out
+
+        # ── Phase 2: thinking-only fallback ─────────────────────────────
+        if not _DEEPSEEK_THINKING_FALLBACK:
+            return out
+
+        # Only fire if:
+        #   - stop_reason is end_turn (model thinks it's done)
+        #   - there is at least one thinking block with real content
+        #   - there is NO non-empty text block
+        delta_obj = message_delta_obj.get("delta") or {}
+        stop_reason = delta_obj.get("stop_reason")
+        if stop_reason != "end_turn":
+            return out
+        thinking_text = ""
+        has_visible_text = False
+        for rec in self._blocks.values():
+            btype = rec.get("type")
+            body = rec.get("text") or ""
+            if btype == "thinking" and body.strip():
+                thinking_text += body
+            elif btype == "text" and body.strip():
+                has_visible_text = True
+        if has_visible_text or not thinking_text.strip():
+            return out
+
+        excerpt = thinking_text.strip()
+        if len(excerpt) > _DEEPSEEK_THINKING_FALLBACK_MAX:
+            excerpt = excerpt[: _DEEPSEEK_THINKING_FALLBACK_MAX] + "…"
+        wrapped = (
+            "<proxy-recovered-from-thinking>\n"
+            "The model produced only internal reasoning (thinking) and no "
+            "user-visible text. The proxy is surfacing the first "
+            f"{len(excerpt)} chars of that reasoning so the turn is not "
+            "empty. This may repeat if the model keeps replying in "
+            "thinking-only mode.\n\n"
+            f"{excerpt}\n"
+            "</proxy-recovered-from-thinking>"
+        )
+        self._max_idx += 1
+        new_idx = self._max_idx
+        out += _sse_lines("content_block_start", {
+            "type": "content_block_start",
+            "index": new_idx,
+            "content_block": {"type": "text", "text": ""},
+        })
+        out += _sse_lines("content_block_delta", {
+            "type": "content_block_delta",
+            "index": new_idx,
+            "delta": {"type": "text_delta", "text": wrapped},
+        })
+        out += _sse_lines("content_block_stop", {
+            "type": "content_block_stop",
+            "index": new_idx,
+        })
+        self.stats["thinking_fallback_emitted"] += 1
+        logger.info(
+            "DEEPSEEK_ADAPTER thinking_fallback model=%s new_idx=%d "
+            "excerpt_len=%d",
+            self.model, new_idx, len(excerpt),
+        )
+        return out
 
 
 def summarize_request_tools(body):
@@ -1808,6 +2335,7 @@ class ProxyHTTPRequestHandler(BaseHTTPRequestHandler):
         tool_diag = StreamToolDiagnostics(model)
         tool_rewriter = StreamToolInputRewriter(model)
         xml_guard = XmlLeakGuard(model)
+        deepseek_adapter = DeepseekStreamAdapter(model)
 
         def _write_upstream_line(line):
             """Write exactly one upstream SSE line to Claude Code.
@@ -1819,12 +2347,18 @@ class ProxyHTTPRequestHandler(BaseHTTPRequestHandler):
             Exception: when CLAUDE_PROXY_TOOL_REPAIR is on, the rewriter may
             buffer `input_json_delta` lines for known-broken tools and emit a
             patched delta at `content_block_stop`. See StreamToolInputRewriter.
+
+            Exception (2026-07-20): when CLAUDE_PROXY_DEEPSEEK_ADAPTER is on
+            AND the request model is deepseek*, the adapter may inject
+            synthetic tool_use blocks (translated from DSML tokens leaked in
+            thinking) BEFORE `message_delta`. See DeepseekStreamAdapter.
             """
             nonlocal bytes_streamed, line_count
-            for out_line in tool_rewriter.feed(line):
-                self.wfile.write(out_line)
-                bytes_streamed += len(out_line)
-                line_count += 1
+            for rewriter_line in tool_rewriter.feed(line):
+                for out_line in deepseek_adapter.feed(rewriter_line):
+                    self.wfile.write(out_line)
+                    bytes_streamed += len(out_line)
+                    line_count += 1
             self.wfile.flush()
 
         try:
